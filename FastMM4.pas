@@ -6,13 +6,13 @@ FastMM4-AVX (FreePascal support, efficient synchronization, AVX1/AVX2/AVX512/ERM
 
 Written by Maxim Masiutin <maxim@masiutin.com>
 
-Version 1.0.14 (16 August 2026)
+Version 1.0.15 (26 August 2026)
 
 Supported compilers: Embarcadero Delphi, FreePascal (FPC/Lazarus).
 
 A fork of the Fast Memory Manager (FastMM) v4.993 by Pierre le Riche.
 
-Changes in FastMM4-AVX compared to the original FastMM4:
+Changes in FastMM4-AVX Compared to the Original FastMM4:
 
  - Efficient synchronization
    - improved synchronization between the threads; proper synchronization
@@ -300,6 +300,10 @@ If not, see <http://www.gnu.org/licenses/>.
 
 
 FastMM4-AVX Version History:
+
+- 1.0.15 (26 August 2026) Fixed: FreePascal Win64 assembly calls had a
+  misaligned stack; RSI and RDI are now saved across calls on Linux. Added:
+  Tests/check_asm_call_frames.py verifies every assembly call frame in CI.
 
 - 1.0.14 (16 August 2026) Security: refuse a FullDebugMode allocation size
   that cannot have the debug overhead added to it (issue #163), and let a
@@ -1302,15 +1306,15 @@ interface
 {$ENDIF}
 
 {$IFDEF DontUseSmallBlocksLockedCriticalSection}
-  {$undef UseSmallBlocksLockedCriticalSection}
+  {$undef SmallBlocksLockedCriticalSection}
 {$ENDIF}
 
 {$IFDEF DontUseMediumBlocksLockedCriticalSection}
-  {$undef UseMediumBlocksLockedCriticalSection}
+  {$undef MediumBlocksLockedCriticalSection}
 {$ENDIF}
 
 {$IFDEF DontUseLargeBlocksLockedCriticalSection}
-  {$undef UseLargeBlocksLockedCriticalSection}
+  {$undef LargeBlocksLockedCriticalSection}
 {$ENDIF}
 
 {$IFDEF DontUseSimplifiedInterlockedExchangeByte}
@@ -1435,6 +1439,34 @@ interface
     {$define PurePascal}  // Delphi LLVM Linux needs PurePascal
     {$define KYLIX}
   {$ENDIF}
+{$ENDIF}
+
+{Delphi's LLVM-based compilers, Windows ARM64EC among them, have no inline
+ assembler and say so by leaving ASSEMBLER undefined, so they need PurePascal
+ just as Delphi on Linux does above. The test is limited to XE2 and later
+ because the symbol is younger than the assembler: Delphi 4 leaves ASSEMBLER
+ undefined although it compiles every asm block in this unit, while Delphi 7
+ defines it. No LLVM-based Delphi is older than XE2. The original FastMM4 took
+ this change in its pull request 105 without the version limit, and that form
+ stops Delphi 4 from compiling the unit at all.}
+{$IFNDEF FPC}
+  {$IFDEF XE2AndUp}
+    {$IFNDEF ASSEMBLER}
+      {$define PurePascal}
+    {$ENDIF}
+  {$ENDIF}
+{$ENDIF}
+
+{PurePascal is fully decided at this point, whether by the options file, the
+ command line, the Linux block or the test above, and nothing below defines it.
+ ASMVersion is cleared here as well as further down, because the blocks in
+ between derive FastGetMemNeedAssemblerCode, FastFreememNeedAssemberCode,
+ FastReallocMemNeedAssemberCode and Use32BITAsm from it. Clearing it only after
+ they had run left those symbols set, so a PurePascal build still compiled the
+ assembler allocator. Delphi on Linux escaped that only because its PIC block
+ clears ASMVersion early on its own.}
+{$IFDEF PurePascal}
+  {$undef ASMVersion}
 {$ENDIF}
 
 {$IFDEF DARWIN}
@@ -1854,6 +1886,22 @@ of just one option: "Boolean short-circuit evaluation".}
   {$define DisablePauseAndSwitchToThread}
 {$ENDIF}
 
+{On an LLVM-based Delphi a plain store to the lock byte is not a release. The
+ optimizer may move earlier stores past it, and on ARM64 the hardware may make
+ it visible before them, so the case for the plain store made above
+ ReleaseLockByte, which rests on x86 store ordering, does not hold there.
+ InterlockedRelease writes the lock byte with an atomic exchange instead, through
+ the same InterlockedExchangeByte the PurePascal acquire path already calls, so
+ it brings in no routine the build did not need already. It is limited to
+ PurePascal because the assembler unlock paths refuse InterlockedRelease. The
+ original FastMM4 made the same change in its pull request 105 under the name
+ UseAtomicLockRelease.}
+{$IFDEF LLVM}
+  {$IFDEF PurePascal}
+    {$define InterlockedRelease}
+  {$ENDIF}
+{$ENDIF}
+
 {$IFDEF XE2AndUp}
   {$define OperatorsInDefinesSupported}
 {$ENDIF}
@@ -1866,7 +1914,7 @@ of just one option: "Boolean short-circuit evaluation".}
 {-------------------------Public constants-----------------------------}
 const
   {The current version of FastMM4-AVX}
-  FastMM4AvxVersion = '1.0.14';
+  FastMM4AvxVersion = '1.0.15';
   {The current version of FastMM}
   FastMMVersion = '4.993';
 
@@ -1926,6 +1974,8 @@ type
   PNativeUInt = ^Cardinal;
   IntPtr = Integer;
   UIntPtr = Cardinal;
+  {PBoolean is not declared by the System unit of Delphi 4.}
+  PBoolean = ^Boolean;
   {$ELSE}
   NativeUInt = PtrUInt;
   PNativeUInt = ^PtrUInt;
@@ -2145,6 +2195,24 @@ procedure FreeAllMemory;
 function FastGetHeapStatus: THeapStatus;
 {Returns statistics about the current state of the memory manager}
 procedure GetMemoryManagerState(var AMemoryManagerState: TMemoryManagerState);
+{$IFDEF UseReleaseStack}
+{$IFDEF EnableReleaseStackTestHooks}
+{Test-only access to the medium and large locks and to the cleanup thread's
+ progress, for Tests/Simple/ReleaseStackTest.dpr. Off by default; never
+ define EnableReleaseStackTestHooks in a production build.}
+procedure ReleaseStackTestLockMediumBlocks;
+procedure ReleaseStackTestUnlockMediumBlocks;
+procedure ReleaseStackTestLockLargeBlocks;
+procedure ReleaseStackTestUnlockLargeBlocks;
+{True when the lock byte reads as taken; meaningful only in builds without
+ the corresponding critical-section option.}
+function ReleaseStackTestMediumBlocksLocked: Boolean;
+function ReleaseStackTestLargeBlocksLocked: Boolean;
+{The number of medium or large frees the cleanup thread has completed.}
+function ReleaseStackTestMediumCleanupFrees: Integer;
+function ReleaseStackTestLargeCleanupFrees: Integer;
+{$ENDIF}
+{$ENDIF}
 {Returns a summary of the information returned by GetMemoryManagerState}
 function GetMemoryManagerUsageSummary: TMemoryManagerUsageSummary; overload;
 procedure GetMemoryManagerUsageSummary(var AMemoryManagerUsageSummary: TMemoryManagerUsageSummary); overload;
@@ -2154,6 +2222,12 @@ procedure GetMemoryMap(var AMemoryMap: TMemoryMap);
 {$ENDIF}
 {Returns the current installation state of the memory manager.}
 function FastMM_GetInstallationState: TFastMM_MemoryManagerInstallationState;
+{$IFDEF MediumSafeUnlinkingTest}
+{Test-only entry point. AMode 0 removes and reinserts a valid medium free
+ block; modes 1 through 7 deliberately corrupt one free-list relationship.
+ Returns true when the safe-unlinking rejection path was reached.}
+function FastMMTestMediumSafeUnlinking(AMode: Integer): Boolean;
+{$ENDIF}
 
 {$IFDEF EnableMemoryLeakReporting}
 {Registers expected memory leaks. Returns true on success. The list of leaked
@@ -2993,8 +3067,12 @@ const
     {$ifend}
   {$ENDIF}
 
+{Lock contention logging and the release stack add fields that make
+ TSmallBlockType larger than the power-of-2 size assumed below.}
 {$IFNDEF LogLockContention}
+{$IFNDEF UseReleaseStack}
   {$define SmallBlockTypeRecSizeIsPowerOf2}
+{$ENDIF}
 {$ENDIF}
 
 {$IFNDEF SmallBlockTypeRecSizeIsPowerOf2}
@@ -3011,14 +3089,12 @@ const
   SmallBlockTypeRecSize = Byte(UnsignedBit shl SmallBlockTypeRecSizePowerOf2);
 {$ENDIF}
 
-{$IFNDEF UseReleaseStack}
-  {$IFDEF OperatorsInDefinesSupported}
-    {$if SmallBlockTypeRecSize <> SizeOf(TSmallBlockType)}
-      {$IFDEF SmallBlockTypeRecSizeIsPowerOf2}
-        {$Message Fatal 'Invalid SmallBlockTypeRecSizePowerOf2 constant or SizeOf(TSmallBlockType) is not a power of 2'}
-      {$ENDIF}
-    {$ifend}
-  {$ENDIF}
+{$IFDEF OperatorsInDefinesSupported}
+  {$if SmallBlockTypeRecSize <> SizeOf(TSmallBlockType)}
+    {$IFDEF SmallBlockTypeRecSizeIsPowerOf2}
+      {$Message Fatal 'Invalid SmallBlockTypeRecSizePowerOf2 constant or SizeOf(TSmallBlockType) is not a power of 2'}
+    {$ENDIF}
+  {$ifend}
 {$ENDIF}
 
 {$IFNDEF BCB6OrDelphi7AndUp}
@@ -3396,7 +3472,9 @@ var
 
 {$IFDEF 32BIT}
   {$IFNDEF LogLockContention}
+  {$IFNDEF UseReleaseStack}
     {$DEFINE AllocSize2SmallBlockTypesPrecomputedOffsets}
+  {$ENDIF}
   {$ENDIF}
 
   {$IFDEF ASMVersion}
@@ -4079,16 +4157,50 @@ asm
 {$IFDEF 64BIT}
 
 // 64-bit code for AcquireSpinLockMediumBlocks
-  {$IFDEF AllowAsmNoframe}
-  .noframe
+  {$IFDEF AllowAsmParams}
+  .params 1
+  .pushnv rbx
+  .pushnv rsi
+  .pushnv rdi
+  .pushnv r12
+  .pushnv r13
+  .pushnv r14
+  .pushnv r15
   {$ENDIF}
+  {$IFNDEF AllowAsmParams}
+   {Here every register this routine promises to preserve is kept on the stack
+    for the whole body rather than parked in another register. The stack keeps
+    them correctly under the System V convention too, where RSI and RDI are
+    call-clobbered and would not survive the calls below, and it needs no
+    register that is nonvolatile in only one of the two conventions.
+    The count of pushes is even
+    so that RSP keeps the 16-byte alignment the ABI requires at each call: the
+    compiler-generated prologue of an assembler routine leaves RSP aligned, and
+    FreePascal emits a single 8-byte allocation for it.}
+   push r15
+   push rcx
+   push rdx
+   push rsi
+   push rdi
    push r8
+   push r9
+   push r10
+   push r11
+   push rax // alignment pad only, popped first
+  {$ENDIF}
+  {$IFDEF AllowAsmParams}
+   {r8 is overwritten by the lock byte address, so the caller's value is saved
+    here; the other volatile registers survive until the first call and are
+    saved on the contended path below.}
+   mov  rdi, r8
+  {$ENDIF}
    {$IFDEF FPC}
    call GetMediumBlocksLockedPointer
    mov  r8, rax
    {$ELSE}
    lea  r8, MediumBlocksLocked
    {$ENDIF}
+   mov  r15, r8
 
    mov  eax, cLockByteLocked
    cmp  [r8], al
@@ -4096,13 +4208,28 @@ asm
    lock xchg [r8], al
    cmp  al, cLockByteLocked
    je   @DidntLockAtFirstAttempt
+   {$IFDEF AllowAsmParams}
+   {No call was made on this path, so only r8, which carries the lock byte
+    address here, has to be put back before returning.}
+   mov  r8, rdi
+   jmp  @FinishUncontended64BIT
+   {$ELSE}
    jmp  @Finish64BIT
+   {$ENDIF}
 @DidntLockAtFirstAttempt:
+   {$IFDEF AllowAsmParams}
+   {Every path from here calls, so the remaining volatile registers are saved
+    here rather than on the uncontended path above.}
+   mov  rbx, rcx
+   mov  rsi, rdx
+   mov  r12, r9
+   mov  r13, r10
+   mov  r14, r11
+   {$ENDIF}
 
 {$IFDEF EnableWaitPKG}
-   push r8
    call GetFastMMCpuFeaturesB
-   pop  r8
+   mov  r8, r15
    test al, FastMMCpuFeatureB_WaitPKG
    jz   @NoWaitPKG
 
@@ -4111,17 +4238,10 @@ asm
    // the monitor and waiting on it, follows the worked umonitor/umwait spin-wait
    // loop at https://stackoverflow.com/a/78095037/6910868
    mov  eax, cLockByteLocked
-   push rcx
-   push rdx
-   push r9
-   push r10
-   push r11
-
    jmp  @FirstLockMonitor
 @DidntLockUmonitor:
-   push r8
    call SwitchToThreadIfSupported
-   pop  r8
+   mov  r8, r15
    mov  eax, cLockByteLocked
    cmp  [r8], al
    jne  @TryXchgAfterUmonitor
@@ -4146,18 +4266,11 @@ asm
    cmp  al, cLockByteLocked
    je   @DidntLockUmonitor
    // Locked after umonitor
-   pop  r11
-   pop  r10
-   pop  r9
-   pop  rdx
-   pop  rcx
-
    jmp  @Finish64BIT
 @NoWaitPKG:
 
    mov  eax, cLockByteLocked
 {$ENDIF EnableWaitPKG}
-   push r9
    mov  r9d, cPauseSpinWaitLoopCount
   {$IFDEF AsmCodeAlign}{$IFDEF AsmAlNoDot}align{$ELSE}.align{$ENDIF} 16{$ENDIF}
 @DidntLockPause64:
@@ -4171,25 +4284,35 @@ asm
    lock xchg [r8], al
    cmp  al, cLockByteLocked
    je   @DidntLockPause64
-   pop  r9
    jmp	@Finish64BIT
 @SwitchToThreadPause64:
-   push rcx
-   push rdx
-   push r8
-   push r10
-   push r11
    call SwitchToThreadIfSupported
-   pop  r11
-   pop  r10
-   pop  r8
-   pop  rdx
-   pop  rcx
+   mov  r8, r15
    mov  eax, cLockByteLocked
    mov  r9d, cPauseSpinWaitLoopCount
    jmp  @NormalLoadLoopPause64
 @Finish64BIT:
+  {$IFDEF AllowAsmParams}
+   mov  rcx, rbx
+   mov  rdx, rsi
+   mov  r8, rdi
+   mov  r9, r12
+   mov  r10, r13
+   mov  r11, r14
+  {$ENDIF}
+@FinishUncontended64BIT:
+  {$IFNDEF AllowAsmParams}
+   pop  rax // the alignment pad
+   pop  r11
+   pop  r10
+   pop  r9
    pop  r8
+   pop  rdi
+   pop  rsi
+   pop  rdx
+   pop  rcx
+   pop  r15
+  {$ENDIF}
 
 {$ELSE 64BIT}
 
@@ -4226,42 +4349,45 @@ end;
 procedure AcquireSpinLockByte(var Target: TSynchronizationVariable); assembler;
 asm
 {$IFDEF 64BIT}
-  {$IFDEF AllowAsmNoframe}
-  .noframe
+  {$IFDEF AllowAsmParams}
+  .params 1
+  .pushnv rbx
+  {$ENDIF}
+  {$IFNDEF AllowAsmParams}
+   {The count of pushes is even so that RSP keeps the 16-byte alignment the ABI
+    requires at the calls below; the compiler-generated prologue of an
+    assembler routine leaves RSP aligned.}
+   push rbx
+   push rax // alignment pad only, popped first
   {$ENDIF}
   {$IFDEF unix}
    mov  rcx, rdi
   {$ENDIF}
   {$IFDEF AsmCodeAlign}{$IFDEF AsmAlNoDot}align{$ELSE}.align{$ENDIF} 4{$ENDIF}
+   mov   rbx, rcx
    mov   eax, cLockByteLocked
-   cmp  [rcx], al
+   cmp  [rbx], al
    je   @DidntLockAtFirstAttempt
-   lock xchg [rcx], al
+   lock xchg [rbx], al
    cmp  al, cLockByteLocked
    je   @DidntLockAtFirstAttempt
    jmp  @Finish
 @DidntLockAtFirstAttempt:
 {$IFDEF EnableWaitPKG}
-   push rcx
    call GetFastMMCpuFeaturesB
-   pop  rcx
    test al, FastMMCpuFeatureB_WaitPKG
    jz   @NoWaitPKG
    mov  eax, cLockByteLocked
    jmp  @FirstLockMonitor
 @DidntLockUmonitor:
-   push r8
-   push rcx
    call SwitchToThreadIfSupported
-   pop  rcx
-   pop  r8
    mov  eax, cLockByteLocked
-   cmp  [rcx], al
+   cmp  [rbx], al
    jne  @TryXchgAfterUmonitor
 
 @FirstLockMonitor:
-   db   $F3, $0F, $AE, $F1 // umonitor rcx
-   cmp  [rcx], al
+   db   $F3, $0F, $AE, $F3 // umonitor rbx
+   cmp  [rbx], al
    jne  @TryXchgAfterUmonitor
 
    mov  eax, CUMWaitTime
@@ -4274,7 +4400,7 @@ asm
    db   $F2, $41, $0F, $AE, $F1 // umwait, r9d
 @TryXchgAfterUmonitor:
    mov  eax, cLockByteLocked
-   lock xchg [rcx], al
+   lock xchg [rbx], al
    cmp  al, cLockByteLocked
    je   @DidntLockUmonitor
    jmp  @Finish
@@ -4290,16 +4416,14 @@ asm
    jz   @SwitchToThread // for static branch prediction, jump forward means "unlikely"
    db   $F3, $90 // pause
 // use the "test, test-and-set" technique, details are in the comment section at the beginning of the file
-   cmp  [rcx], al
+   cmp  [rbx], al
    je   @NormalLoadLoop // for static branch prediction, jump backwards means "likely"
-   lock xchg [rcx], al
+   lock xchg [rbx], al
    cmp  al, cLockByteLocked
    je   @DidntLock
    jmp	@Finish
 @SwitchToThread:
-   push rcx
    call SwitchToThreadIfSupported
-   pop  rcx
    mov  r9d, cPauseSpinWaitLoopCount
    mov  eax, cLockByteLocked
    jmp  @NormalLoadLoop
@@ -4330,6 +4454,12 @@ asm
    jmp  @Init
 {$ENDIF}
 @Finish:
+{$IFDEF 64BIT}
+  {$IFNDEF AllowAsmParams}
+   pop  rax // the alignment pad
+   pop  rbx
+  {$ENDIF}
+{$ENDIF}
 end;
 {$ENDIF AuxAsmRoutines}
 {$ENDIF DisablePauseAndSwitchToThread}
@@ -6554,7 +6684,7 @@ procedure MoveWithErmsNoAVX(const ASource; var ADest; ACount: NativeInt); forwar
  SizeOf(Pointer). Important note: Always moves at least 16 - SizeOf(Pointer)
  bytes (the minimum small block size with 16 byte alignment), irrespective of
  ACount.}
-procedure MoveX16LP(const ASource; var ADest; ACount: NativeInt); assembler; {$IFDEF fpc64BIT}  nostackframe; {$ENDIF}
+procedure MoveX16LP(const ASource; var ADest; ACount: NativeInt); assembler;
 asm
 {$IFDEF 32BIT}
   test FastMMCpuFeaturesA, FastMMCpuFeatureERMS
@@ -6646,16 +6776,37 @@ asm
 {$ENDIF ForceMMX}
 {$ELSE 32BIT}
   {$IFNDEF unix}
-  {$IFDEF AllowAsmNoframe}
-  .noframe
+  {$IFDEF AllowAsmParams}
+  .params 3
+  .pushnv rbx
+  .pushnv rsi
+  .pushnv rdi
   {$ENDIF}
+  {$IFDEF AllowAsmParams}
+  mov rbx, rcx
+  mov rsi, rdx
+  mov rdi, r8
+  {$ELSE}
+  {The number of pushes is kept even. The compiler-generated prologue of an
+   assembler routine leaves RSP 16-byte aligned (FreePascal emits a single
+   8-byte allocation here), so an odd number of pushes would leave the call
+   below one slot away from the alignment the ABI requires at entry.}
   push rcx
   push rdx
   push r8
+  push r9 // alignment pad only, popped first
+  {$ENDIF}
   call GetFastMMCpuFeaturesA
+  {$IFDEF AllowAsmParams}
+  mov rcx, rbx
+  mov rdx, rsi
+  mov r8, rdi
+  {$ELSE}
+  pop  r9
   pop  r8
   pop  rdx
   pop  rcx
+  {$ENDIF}
   test al, FastMMCpuFeatureERMS
   jz @NoERMS
   call MoveWithErmsNoAVX
@@ -6783,8 +6934,9 @@ asm
   mov rcx, [rcx + r8]
   mov [rdx + r8], rcx
   {$ELSE unix}
-  {MoveX32LP is not implemented for Unix yet, call the 16-byte version}
-  call MoveX16LP
+  {MoveX32LP is not implemented for Unix yet. Tail-dispatch to the 16-byte
+   version so this nostackframe routine remains a leaf.}
+  jmp MoveX16LP
   {$ENDIF unix}
 @exit:
 end;
@@ -6843,8 +6995,9 @@ asm
   mov rcx, [rcx + r8]
   mov [rdx + r8], rcx
   {$ELSE unix}
-  {MoveX32LP is not implemented for Unix yet, call the 16-byte version}
-  call MoveX16LP
+  {MoveX32LP is not implemented for Unix yet. Tail-dispatch to the 16-byte
+   version so this nostackframe routine remains a leaf.}
+  jmp MoveX16LP
   {$ENDIF unix}
 @exit:
 end;
@@ -6938,8 +7091,9 @@ asm
   mov rcx, [rcx + r8]
   mov [rdx + r8], rcx
   {$ELSE unix}
-  {MoveX32LP is not implemented for Unix yet, call the 16-byte version}
-  call MoveX16LP
+  {MoveX32LP is not implemented for Unix yet. Tail-dispatch to the 16-byte
+   version so this nostackframe routine remains a leaf.}
+  jmp MoveX16LP
   {$ENDIF unix}
 @exit:
 end;
@@ -7021,8 +7175,9 @@ asm
   mov rcx, [rcx + r8]
   mov [rdx + r8], rcx
   {$ELSE unix}
-  {MoveX32LP is not implemented for Unix yet, call the 16-byte version}
-  call MoveX16LP
+  {MoveX32LP is not implemented for Unix yet. Tail-dispatch to the 16-byte
+   version so this nostackframe routine remains a leaf.}
+  jmp MoveX16LP
   {$ENDIF unix}
 @exit:
 end;
@@ -7194,8 +7349,10 @@ asm
 
 {$ELSE}
   {$IFNDEF unix}
-  {$IFDEF AllowAsmNoframe}
-  .noframe
+  {$IFDEF AllowAsmParams}
+  .params 1
+  .pushnv rsi
+  .pushnv rdi
   {$ENDIF}
 
 // under Win64, first - RCX, second - RDX, third R8; the caller must preserve RSI and RDI
@@ -7214,8 +7371,10 @@ asm
   jmp    @exit
 
 @beg:
+  {$IFNDEF AllowAsmParams}
   mov    r9, rsi  // save rsi
   mov    r10, rdi // save rdi
+  {$ENDIF}
   mov    rsi, rcx
   mov    rdi, rdx
   mov    rcx, r8
@@ -7293,11 +7452,7 @@ asm
   // lengths the setup dominates the copy. Later processor generations may
   // differ, and the figures are quoted here for the size of the effect rather
   // than as constants. See https://stackoverflow.com/a/45123049/6910868
-  push    rsi
-  push    rdi
   call    GetFastMMCpuFeaturesA
-  pop     rdi
-  pop     rsi
   test    al, FastMMCpuFeatureFSRM
   jnz     @movs
 {$ENDIF}
@@ -7331,8 +7486,10 @@ asm
   sub     rcx, 4
   jg      @again2
 @finish:
+  {$IFNDEF AllowAsmParams}
   mov    rsi, r9
   mov    rdi, r10
+  {$ENDIF}
   {$ELSE}
 // Under Unix 64 the first 3 arguments are passed in RDI, RSI, RDX
   mov    rcx, rsi
@@ -8541,6 +8698,136 @@ begin
 end;
 {$ENDIF}
 
+{Reject a corrupt medium free-list neighbourhood before RemoveMediumFreeBlock
+ writes through either link. The shared predicate keeps Pascal and both
+ assembly widths identical.
+
+ The order of the tests is deliberate. All three reviewers of pull request 176
+ found that the pool walk below makes the cost grow with the number of medium
+ block pools, and asked for the reciprocal test to run first so the walk could
+ be skipped for corrupt input. That order was tried and reverted: the
+ reciprocal test loads through both links, so it cannot run until ownership is
+ established. With it first, the test vectors that point a link at an aligned
+ but unmapped address fault inside the medium-block lock and the process
+ hangs rather than reporting a rejection.
+
+ So ownership is settled first, by two tests that dereference nothing and then
+ by the walk, and the reciprocal test runs last on links already known to
+ address memory this allocator owns. The two cheap tests are whether a link
+ points into MediumBlockBins at a bin-sized offset, which is what a list of
+ one entry looks like, and whether a link that is not a bin address is at
+ least aligned.
+
+ Deriving a pool base from an address would be constant time and would remove
+ the walk, but it is not available here: MediumBlockPoolSize is not a power of
+ two and the pools come from VirtualAlloc with no alignment guarantee, so no
+ mask recovers the base. Removing the cost needs ownership bookkeeping the
+ allocator does not yet keep.}
+function MediumFreeBlockLinksValid(APMediumFreeBlock: PMediumFreeBlock): Boolean;
+var
+  LPreviousFreeBlock,
+  LNextFreeBlock: PMediumFreeBlock;
+  LFirstPool,
+  LSlowPool,
+  LPool: PMediumBlockPoolHeader;
+  LPreviousAddress,
+  LNextAddress,
+  LPoolStart,
+  LPoolEnd: UIntPtr;
+  LPreviousOwned,
+  LNextOwned,
+  LAdvanceSlow: Boolean;
+begin
+  LNextFreeBlock := APMediumFreeBlock^.NextFreeBlock;
+  LPreviousFreeBlock := APMediumFreeBlock^.PreviousFreeBlock;
+  LPreviousAddress := UIntPtr(LPreviousFreeBlock);
+  LNextAddress := UIntPtr(LNextFreeBlock);
+
+  LPreviousOwned := (LPreviousAddress >= UIntPtr(@MediumBlockBins[0])) and
+    (LPreviousAddress <= UIntPtr(@MediumBlockBins[MediumBlockBinCount - 1])) and
+    (((LPreviousAddress - UIntPtr(@MediumBlockBins[0])) and
+      ((1 shl MediumFreeBlockSizePowerOf2) - 1)) = 0);
+  LNextOwned := (LNextAddress >= UIntPtr(@MediumBlockBins[0])) and
+    (LNextAddress <= UIntPtr(@MediumBlockBins[MediumBlockBinCount - 1])) and
+    (((LNextAddress - UIntPtr(@MediumBlockBins[0])) and
+      ((1 shl MediumFreeBlockSizePowerOf2) - 1)) = 0);
+
+  if (not LPreviousOwned) and
+     ((LPreviousAddress and (SmallBlockGranularity - 1)) <> 0) then
+  begin
+    Result := False;
+    Exit;
+  end;
+  if (not LNextOwned) and
+     ((LNextAddress and (SmallBlockGranularity - 1)) <> 0) then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  if not (LPreviousOwned and LNextOwned) then
+  begin
+    LPool := MediumBlockPoolsCircularList.NextMediumBlockPoolHeader;
+    LFirstPool := LPool;
+    LSlowPool := LPool;
+    LAdvanceSlow := False;
+    while LPool <> @MediumBlockPoolsCircularList do
+    begin
+      if LPool = nil then
+        Break;
+      LPoolStart := UIntPtr(LPool) + MediumBlockPoolHeaderSize;
+      LPoolEnd := UIntPtr(LPool) + MediumBlockPoolSize - SizeOf(TMediumFreeBlock);
+      if (not LPreviousOwned) and (LPreviousAddress >= LPoolStart) and
+         (LPreviousAddress <= LPoolEnd) then
+        LPreviousOwned := True;
+      if (not LNextOwned) and (LNextAddress >= LPoolStart) and
+         (LNextAddress <= LPoolEnd) then
+        LNextOwned := True;
+      if LPreviousOwned and LNextOwned then
+        Break;
+      LPool := LPool^.NextMediumBlockPoolHeader;
+      if (LPool = LFirstPool) or (LPool = LSlowPool) then
+        Break;
+      if LAdvanceSlow then
+      begin
+        if (LSlowPool = nil) or
+           (LSlowPool = @MediumBlockPoolsCircularList) then
+          Break;
+        LSlowPool := LSlowPool^.NextMediumBlockPoolHeader;
+      end;
+      LAdvanceSlow := not LAdvanceSlow;
+    end;
+  end;
+
+  Result := LPreviousOwned and LNextOwned;
+  if Result then
+    Result := LPreviousFreeBlock^.NextFreeBlock = APMediumFreeBlock;
+  if Result then
+    Result := LNextFreeBlock^.PreviousFreeBlock = APMediumFreeBlock;
+end;
+
+{$IFDEF MediumSafeUnlinkingTest}
+var
+  MediumSafeUnlinkingFailureSeen: Boolean;
+{$ENDIF}
+
+procedure RaiseInvalidPtrForSafeUnlinking;
+begin
+  {$IFDEF MediumSafeUnlinkingTest}
+  MediumSafeUnlinkingFailureSeen := True;
+  Exit;
+  {$ENDIF}
+  {$IFDEF FPC}
+  System.Error(TRuntimeError(reInvalidPtr));
+  {$ELSE}
+  {$IFDEF BCB6OrDelphi7AndUp}
+  System.Error(reInvalidPtr);
+  {$ELSE}
+  System.RunError(reInvalidPtr);
+  {$ENDIF}
+  {$ENDIF}
+end;
+
 {Removes a medium block from the circular linked list of free blocks.
  Does not change any header flags. Medium blocks should be locked
  before calling this procedure.}
@@ -8554,6 +8841,11 @@ var
   LBinNumber,
   LBinGroupNumber: Cardinal;
 begin
+  if not MediumFreeBlockLinksValid(APMediumFreeBlock) then
+  begin
+    RaiseInvalidPtrForSafeUnlinking;
+    Exit;
+  end;
   {Get the current previous and next blocks}
   LNextFreeBlock := APMediumFreeBlock^.NextFreeBlock;
   LPreviousFreeBlock := APMediumFreeBlock^.PreviousFreeBlock;
@@ -8606,6 +8898,11 @@ end;
 assembler;
 asm
   {On entry: eax = APMediumFreeBlock}
+  push eax
+  call MediumFreeBlockLinksValid
+  test al, al
+  pop eax
+  jz @CorruptFreeList
   {Get the current previous and next blocks}
   mov ecx, TMediumFreeBlock[eax].NextFreeBlock
   mov edx, TMediumFreeBlock[eax].PreviousFreeBlock
@@ -8620,6 +8917,9 @@ asm
   je @BinIsNowEmpty
   {$IFDEF AsmCodeAlign}{$IFDEF AsmAlNoDot}align{$ELSE}.align{$ENDIF} 2{$ENDIF}
 @Done:
+  jmp @Exit
+@CorruptFreeList:
+  call RaiseInvalidPtrForSafeUnlinking
   jmp @Exit
   {$IFDEF AsmCodeAlign}{$IFDEF AsmAlNoDot}align{$ELSE}.align{$ENDIF} 8{$ENDIF}
 @BinIsNowEmpty:
@@ -8676,10 +8976,30 @@ end;
 {$ELSE}
 assembler;
 asm
-{$IFDEF AllowAsmNoframe}
-  .noframe
+{$IFDEF AllowAsmParams}
+  .params 1
+  .pushnv rbx
+{$ENDIF}
+{$IFNDEF AllowAsmParams}
+  {The count of pushes is even so that RSP keeps the 16-byte alignment the ABI
+   requires at the call below; the compiler-generated prologue of an assembler
+   routine leaves RSP aligned. Neither pop disturbs the flags the test sets.}
+  push rcx
+  push rax // alignment pad only
 {$ENDIF}
   {On entry: rcx = APMediumFreeBlock}
+{$IFDEF AllowAsmParams}
+  mov rbx, rcx
+{$ENDIF}
+  call MediumFreeBlockLinksValid
+  test al, al
+{$IFDEF AllowAsmParams}
+  mov rcx, rbx
+{$ELSE}
+  pop rax
+  pop rcx
+{$ENDIF}
+  jz @CorruptFreeList
   mov rax, rcx
   {Get the current previous and next blocks}
   mov rcx, TMediumFreeBlock[rax].NextFreeBlock
@@ -8732,7 +9052,7 @@ asm
   mov ecx, edx
   rol eax, cl
   and MediumBlockBinGroupBitmap, eax
-{$IFNDEF SoftInvalidFreeMem}
+  {$IFNDEF SoftInvalidFreeMem}
   jmp @Done
   {$IFDEF AsmCodeAlign}{$IFDEF AsmAlNoDot}align{$ELSE}.align{$ENDIF} 4{$ENDIF}
 @CorruptBinPointer:
@@ -8743,11 +9063,100 @@ asm
   {$ELSE}
   call RunErrorInvalidPtr
   {$ENDIF}
-{$ENDIF}
+  {$ENDIF}
+  jmp @Done
+@CorruptFreeList:
+  call RaiseInvalidPtrForSafeUnlinking
+  jmp @Done
   {$IFDEF AsmCodeAlign}{$IFDEF AsmAlNoDot}align{$ELSE}.align{$ENDIF} 2{$ENDIF}
 @Done:
 end;
 {$ENDIF}
+{$ENDIF}
+
+{$IFDEF MediumSafeUnlinkingTest}
+function FastMMTestMediumSafeUnlinking(AMode: Integer): Boolean;
+const
+  TestBlockSize = 8192;
+var
+  LBlocks: array[0..3] of Pointer;
+  LIndex: Integer;
+  LVictim,
+  LPrevious,
+  LNext,
+  LSavedVictimPrevious,
+  LSavedVictimNext,
+  LSavedPreviousNext,
+  LSavedNextPrevious: PMediumFreeBlock;
+  LFirstFreed,
+  LThirdFreed,
+  LLocked: Boolean;
+begin
+  MediumSafeUnlinkingFailureSeen := False;
+  for LIndex := 0 to 3 do
+    LBlocks[LIndex] := nil;
+  LFirstFreed := False;
+  LThirdFreed := False;
+  LLocked := False;
+  try
+    for LIndex := 0 to 3 do
+    begin
+      LBlocks[LIndex] := FastGetMem(TestBlockSize);
+      if LBlocks[LIndex] = nil then
+        System.RunError(Ord(reOutOfMemory));
+    end;
+
+    FastFreeMem(LBlocks[0]);
+    LFirstFreed := True;
+    FastFreeMem(LBlocks[2]);
+    LThirdFreed := True;
+
+    LockMediumBlocks;
+    LLocked := True;
+    LVictim := PMediumFreeBlock(LBlocks[2]);
+    LPrevious := LVictim^.PreviousFreeBlock;
+    LNext := LVictim^.NextFreeBlock;
+    LSavedVictimPrevious := LPrevious;
+    LSavedVictimNext := LNext;
+    LSavedPreviousNext := LPrevious^.NextFreeBlock;
+    LSavedNextPrevious := LNext^.PreviousFreeBlock;
+    try
+      case AMode of
+        0: ;
+        1: LPrevious^.NextFreeBlock := LNext;
+        2: LNext^.PreviousFreeBlock := LPrevious;
+        3: LVictim^.NextFreeBlock := PMediumFreeBlock(NativeUInt($DEADBEE0));
+        4: LVictim^.PreviousFreeBlock := PMediumFreeBlock(NativeUInt($DEADBEE0));
+        5: LVictim^.NextFreeBlock := PMediumFreeBlock(@MediumBlockPoolsCircularList);
+        6: LVictim^.NextFreeBlock := nil;
+        7: LVictim^.PreviousFreeBlock :=
+          PMediumFreeBlock(NativeUInt(LPrevious) + 1);
+      else
+        System.RunError(Ord(reInvalidOp));
+      end;
+      RemoveMediumFreeBlock(LVictim);
+    finally
+      LVictim^.PreviousFreeBlock := LSavedVictimPrevious;
+      LVictim^.NextFreeBlock := LSavedVictimNext;
+      LPrevious^.NextFreeBlock := LSavedPreviousNext;
+      LNext^.PreviousFreeBlock := LSavedNextPrevious;
+      UnlockMediumBlocks;
+      LLocked := False;
+    end;
+  finally
+    if LLocked then
+      UnlockMediumBlocks;
+    if (LBlocks[1] <> nil) then
+      FastFreeMem(LBlocks[1]);
+    if (LBlocks[3] <> nil) then
+      FastFreeMem(LBlocks[3]);
+    if (LBlocks[0] <> nil) and not LFirstFreed then
+      FastFreeMem(LBlocks[0]);
+    if (LBlocks[2] <> nil) and not LThirdFreed then
+      FastFreeMem(LBlocks[2]);
+  end;
+  Result := MediumSafeUnlinkingFailureSeen;
+end;
 {$ENDIF}
 
 {Inserts a medium block into the appropriate medium block bin.}
@@ -9347,8 +9756,19 @@ var
 {$ENDIF}
 begin
   LPointer := APointer;
+{$IFDEF UseReleaseStack}
+  {LockLargeBlocks sets this flag only in the builds without
+   LargeBlocksLockedCriticalSection, and the test below also runs when the
+   lock was not taken, so start from False rather than from stack garbage.}
+  LDelayRelease := False;
+{$ENDIF}
 {$IFNDEF AssumeMultiThreaded}
   LLargeBlocksLocked := False;
+  {$IFDEF UseReleaseStack}
+  {A cleanup operation enters with the large blocks already locked by the
+   cleanup thread, so this call owns the lock and must release it.}
+  LLargeBlocksLocked := ACleanupOperation;
+  {$ENDIF}
 {$ENDIF}
 {$IFDEF ClearLargeBlocksBeforeReturningToOS}
   FillChar(LPointer^,
@@ -11886,6 +12306,15 @@ var
   LMediumBlocksLocked: Boolean;
 begin
   LMediumBlocksLocked := False;
+{$IFDEF UseReleaseStack}
+  {LockMediumBlocks sets this flag only in the builds without
+   MediumBlocksLockedCriticalSection, so start from False rather than from
+   stack garbage.}
+  LDelayRelease := False;
+  {A cleanup operation enters with the medium blocks already locked by the
+   cleanup thread, so this call owns the lock and must release it.}
+  LMediumBlocksLocked := ACleanupOperation;
+{$ENDIF}
 {$IFNDEF AssumeMultiThreaded}
   LWasMultiThread := False;
 {$ENDIF}
@@ -16544,7 +16973,12 @@ var
   L: Integer;
 begin
   LBufferLengthChars := ABufferLengthChars;
-  {Get the current call stack}
+  {Get the current call stack. The array is cleared first because the Win64
+   DLL's GetFrameBasedStackTrace is RtlCaptureStackBackTrace, which writes only
+   the frames it finds, and LogStackTrace reads entries up to the first zero;
+   with fewer than StackTraceDepth frames on the stack, the entries past the
+   last one would otherwise be whatever the stack held before this call.}
+  DebugFillMem(LCurrentStackTrace, SizeOf(LCurrentStackTrace), 0);
   GetStackTrace(@LCurrentStackTrace[0], StackTraceDepth, ASkipFrames);
   {Log the thread ID}
   Result := ABuffer;
@@ -16558,18 +16992,23 @@ begin
       Dec(LBufferLengthChars, Length(CurrentThreadIDMsg));
       LInitialBufPtr := Result;
       LInitialLengthChars := LBufferLengthChars;
-      Result := NativeUIntToHexBuf(GetThreadID, Result, LInitialLengthChars-NativeUInt(LInitialBufPtr-Result));
-      {List the stack trace}
-      if LInitialBufPtr >= Result then
+      Result := NativeUIntToHexBuf(GetThreadID, Result, LInitialLengthChars);
+      {List the stack trace. The two tests below measure how far the writes
+       above advanced the buffer, so the pointer written to is the one that has
+       to be the larger of the pair. They used to be written the other way
+       round, LInitialBufPtr >= Result, which held only when the thread ID had
+       not been written at all, so every report produced since 2017 ended at
+       the thread ID and carried no current stack trace.}
+      if Result >= LInitialBufPtr then
       begin
-        LDiff := LInitialBufPtr-Result;
-        if LDiff <= LInitialLengthChars then
+        LDiff := NativeUInt(Result-LInitialBufPtr);
+        if LDiff < LInitialLengthChars then
         begin
           Result := AppendStringToBuffer(CurrentStackTraceMsg, Result, Length(CurrentStackTraceMsg), LInitialLengthChars-LDiff);
-          if LInitialBufPtr >= Result then
+          if Result >= LInitialBufPtr then
           begin
-            LDiff := LInitialBufPtr-Result;
-            if LDiff <= LInitialLengthChars then
+            LDiff := NativeUInt(Result-LInitialBufPtr);
+            if LDiff < LInitialLengthChars then
             begin
               Result := LogStackTrace(@LCurrentStackTrace[0], StackTraceDepth, Result);
             end;
@@ -18278,7 +18717,7 @@ begin
       {$IFNDEF AssumeMultiThreaded}
         if IsMultiThread then
       {$ENDIF}
-      ReleaseLockByte(@ExpectedMemoryLeaksListLocked);
+      ReleaseLockByte(ExpectedMemoryLeaksListLocked);
     end
     else
     begin
@@ -20303,92 +20742,6 @@ begin
 end;
 
 procedure LogReleaseStackUsage;
-
-  procedure NewLine;
-  begin
-    LMsgPtr^ := #13; Inc(LMsgPtr);
-    LMsgPtr^ := #10; Inc(LMsgPtr);
-  end;
-
-  procedure AppendMemorySize(ASize: NativeUInt);
-  begin
-    if ASize < 10*1024 then
-    begin
-      LMsgPtr := NativeUIntToStrBuf(Round(ASize/1024), LMsgPtr);
-      LMsgPtr^ := ' '; Inc(LMsgPtr);
-      LMsgPtr^ := 'K'; Inc(LMsgPtr);
-      LMsgPtr^ := 'B'; Inc(LMsgPtr);
-    end
-    else if ASize < 10*1024*1024 then
-    begin
-      LMsgPtr := NativeUIntToStrBuf(Round(ASize/1024), LMsgPtr);
-      LMsgPtr^ := ' '; Inc(LMsgPtr);
-      LMsgPtr^ := 'K'; Inc(LMsgPtr);
-      LMsgPtr^ := 'B'; Inc(LMsgPtr);
-    end
-    else if (ASize div 1024) < 10*1024*1024 then
-    begin
-      LMsgPtr := NativeUIntToStrBuf(Round(ASize/1024/1024), LMsgPtr);
-      LMsgPtr^ := ' '; Inc(LMsgPtr);
-      LMsgPtr^ := 'M'; Inc(LMsgPtr);
-      LMsgPtr^ := 'B'; Inc(LMsgPtr);
-    end
-    else
-    begin
-      LMsgPtr := NativeUIntToStrBuf(Round(ASize/1024/1024/1024), LMsgPtr);
-      LMsgPtr^ := ' '; Inc(LMsgPtr);
-      LMsgPtr^ := 'G'; Inc(LMsgPtr);
-      LMsgPtr^ := 'B'; Inc(LMsgPtr);
-    end;
-  end;
-
-  procedure AppendSlotInfo(ABlockSize: Integer);
-  var
-    LCount: Integer;
-    LSlot: Integer;
-    LTotal: NativeUInt;
-  begin
-    if ABlockSize > 0 then
-    begin
-      LMsgPtr := AppendStringToBuffer(ReleaseStackUsageSmallBlocksMsg1, LMsgPtr, Length(ReleaseStackUsageSmallBlocksMsg1));
-      LMsgPtr := NativeUIntToStrBuf(ABlockSize, LMsgPtr);
-      LMsgPtr := AppendStringToBuffer(ReleaseStackUsageSmallBlocksMsg2, LMsgPtr, Length(ReleaseStackUsageSmallBlocksMsg2));
-    end
-    else if ABlockSize = -1 then
-      LMsgPtr := AppendStringToBuffer(ReleaseStackUsageMediumBlocksMsg, LMsgPtr, Length(ReleaseStackUsageMediumBlocksMsg))
-    else
-      LMsgPtr := AppendStringToBuffer(ReleaseStackUsageLargeBlocksMsg, LMsgPtr, Length(ReleaseStackUsageLargeBlocksMsg));
-
-    LTotal := 0;
-    LCount := 0;
-    for LSlot := 0 to NumStacksPerBlock-1 do
-    begin
-      Inc(LTotal, LSlotSize[LSlot]);
-      Inc(LCount, LSlotCount[LSlot]);
-    end;
-
-    AppendMemorySize(LTotal);
-    LMsgPtr := AppendStringToBuffer(ReleaseStackUsageBuffers1Msg, LMsgPtr, Length(ReleaseStackUsageBuffers1Msg));
-    LMsgPtr := NativeUIntToStrBuf(LCount, LMsgPtr);
-    LMsgPtr := AppendStringToBuffer(ReleaseStackUsageBuffers2Msg, LMsgPtr, Length(ReleaseStackUsageBuffers2Msg));
-    for LSlot := 0 to NumStacksPerBlock-1 do
-    begin
-      AppendMemorySize(LSlotSize[LSlot]);
-      LMsgPtr^ := '/';
-      Inc(LMsgPtr);
-      LMsgPtr := NativeUIntToStrBuf(LSlotCount[LSlot], LMsgPtr);
-      if LSlot < (NumStacksPerBlock-1) then
-      begin
-        LMsgPtr^ := ' ';
-        Inc(LMsgPtr);
-      end;
-    end;
-    LMsgPtr^ := ']';
-    Inc(LMsgPtr);
-
-    NewLine;
-  end;
-
 var
   LCount: integer;
   LInd: Integer;
@@ -20401,13 +20754,111 @@ var
   LTotalLarge: NativeUInt;
   LTotalMedium: NativeUInt;
   LTotalSmall: NativeUInt;
+  LSmallBlocksLocked: Boolean;
   LMediumBlocksLocked: Boolean;
   LLargeBlocksLocked: Boolean;
+
+  {Characters left in LMessage, keeping one for the trailing #0}
+  function RemainingChars: Cardinal;
+  begin
+    Result := Cardinal(MaxLogMessageLength - 1) - Cardinal(NativeUInt(LMsgPtr) - NativeUInt(@LMessage[0]));
+  end;
+
+  procedure AppendChar(AChar: AnsiChar);
+  begin
+    if RemainingChars > 0 then
+    begin
+      LMsgPtr^ := AChar;
+      Inc(LMsgPtr);
+    end;
+  end;
+
+  procedure AppendText(const AText: PAnsiChar; ALengthChars: Cardinal);
+  begin
+    LMsgPtr := AppendStringToBuffer(AText, LMsgPtr, ALengthChars, RemainingChars);
+  end;
+
+  procedure AppendNumber(ANum: NativeUInt);
+  begin
+    LMsgPtr := NativeUIntToStrBuf(ANum, LMsgPtr, RemainingChars);
+  end;
+
+  procedure NewLine;
+  begin
+    AppendChar(#13);
+    AppendChar(#10);
+  end;
+
+  procedure AppendMemorySize(ASize: NativeUInt);
+  begin
+    if ASize < 10*1024*1024 then
+    begin
+      AppendNumber(Round(ASize/1024));
+      AppendText(' KB', 3);
+    end
+    else if (ASize div 1024) < 10*1024*1024 then
+    begin
+      AppendNumber(Round(ASize/1024/1024));
+      AppendText(' MB', 3);
+    end
+    else
+    begin
+      AppendNumber(Round(ASize/1024/1024/1024));
+      AppendText(' GB', 3);
+    end;
+  end;
+
+  procedure AppendSlotInfo(ABlockSize: Integer);
+  var
+    LSlotTotalCount: Integer;
+    LSlotIndex: Integer;
+    LSlotTotal: NativeUInt;
+  begin
+    if ABlockSize > 0 then
+    begin
+      AppendText(ReleaseStackUsageSmallBlocksMsg1, Length(ReleaseStackUsageSmallBlocksMsg1));
+      AppendNumber(NativeUInt(ABlockSize));
+      AppendText(ReleaseStackUsageSmallBlocksMsg2, Length(ReleaseStackUsageSmallBlocksMsg2));
+    end
+    else if ABlockSize = -1 then
+      AppendText(ReleaseStackUsageMediumBlocksMsg, Length(ReleaseStackUsageMediumBlocksMsg))
+    else
+      AppendText(ReleaseStackUsageLargeBlocksMsg, Length(ReleaseStackUsageLargeBlocksMsg));
+
+    LSlotTotal := 0;
+    LSlotTotalCount := 0;
+    for LSlotIndex := 0 to NumStacksPerBlock-1 do
+    begin
+      Inc(LSlotTotal, LSlotSize[LSlotIndex]);
+      Inc(LSlotTotalCount, LSlotCount[LSlotIndex]);
+    end;
+
+    AppendMemorySize(LSlotTotal);
+    AppendText(ReleaseStackUsageBuffers1Msg, Length(ReleaseStackUsageBuffers1Msg));
+    AppendNumber(NativeUInt(LSlotTotalCount));
+    AppendText(ReleaseStackUsageBuffers2Msg, Length(ReleaseStackUsageBuffers2Msg));
+    for LSlotIndex := 0 to NumStacksPerBlock-1 do
+    begin
+      AppendMemorySize(LSlotSize[LSlotIndex]);
+      AppendChar('/');
+      AppendNumber(NativeUInt(LSlotCount[LSlotIndex]));
+      if LSlotIndex < (NumStacksPerBlock-1) then
+        AppendChar(' ');
+    end;
+    AppendChar(']');
+
+    NewLine;
+  end;
+
 begin
-  LMsgPtr := AppendStringToBuffer(ReleaseStackUsageHeader, @LMessage[0], Length(ReleaseStackUsageHeader));
+  LMsgPtr := @LMessage[0];
+  AppendText(ReleaseStackUsageHeader, Length(ReleaseStackUsageHeader));
   NewLine;
   NewLine;
 
+  LSmallBlocksLocked := False;
+  LMediumBlocksLocked := False;
+  LLargeBlocksLocked := False;
 {$IFNDEF AssumeMultiThreaded}
   if IsMultiThread then
 {$ENDIF}
@@ -20430,12 +20881,12 @@ begin
     end;
     if LSmallBlocksLocked then
     begin
-      ReleaseLockByte(@SmallBlockTypes[LInd].SmallBlockTypeLocked);
+      ReleaseLockByte(SmallBlockTypes[LInd].SmallBlockTypeLocked);
     end;
     AppendSlotInfo(SmallBlockTypes[LInd].BlockSize);
   end;
 
-  LMsgPtr := AppendStringToBuffer(ReleaseStackUsageTotalSmallBlocksMsg, LMsgPtr, Length(ReleaseStackUsageTotalSmallBlocksMsg));
+  AppendText(ReleaseStackUsageTotalSmallBlocksMsg, Length(ReleaseStackUsageTotalSmallBlocksMsg));
   AppendMemorySize(LTotalSmall);
   NewLine;
 
@@ -20467,14 +20918,14 @@ begin
   end;
   AppendSlotInfo(-2);
 
-  LMsgPtr := AppendStringToBuffer(ReleaseStackUsageTotalMemoryMsg, LMsgPtr, Length(ReleaseStackUsageTotalMemoryMsg));
+  AppendText(ReleaseStackUsageTotalMemoryMsg, Length(ReleaseStackUsageTotalMemoryMsg));
   AppendMemorySize(LTotalSmall + LTotalMedium + LTotalLarge);
   NewLine;
 
-  {Trailing #0}
+  {Trailing #0; RemainingChars always keeps room for it}
   LMsgPtr^ := #0;
 
-    AppendEventLog(@LMessage[0], NativeUInt(LMsgPtr) - NativeUInt(@LMessage[0]));
+  AppendEventLog(@LMessage[0], NativeUInt(LMsgPtr) - NativeUInt(@LMessage[0]));
 end;
 {$ENDIF}
 {$ENDIF}
@@ -21705,6 +22156,50 @@ begin
 end;
 
 {$IFDEF UseReleaseStack}
+{$IFDEF EnableReleaseStackTestHooks}
+var
+  ReleaseStackTestMediumFrees, ReleaseStackTestLargeFrees: Integer;
+
+procedure ReleaseStackTestLockMediumBlocks;
+begin
+  LockMediumBlocks;
+end;
+
+procedure ReleaseStackTestUnlockMediumBlocks;
+begin
+  UnlockMediumBlocks;
+end;
+
+procedure ReleaseStackTestLockLargeBlocks;
+begin
+  LockLargeBlocks;
+end;
+
+procedure ReleaseStackTestUnlockLargeBlocks;
+begin
+  UnlockLargeBlocks;
+end;
+
+function ReleaseStackTestMediumBlocksLocked: Boolean;
+begin
+  Result := MediumBlocksLocked = cLockByteLocked;
+end;
+
+function ReleaseStackTestLargeBlocksLocked: Boolean;
+begin
+  Result := LargeBlocksLocked = cLockByteLocked;
+end;
+
+function ReleaseStackTestMediumCleanupFrees: Integer;
+begin
+  Result := ReleaseStackTestMediumFrees;
+end;
+
+function ReleaseStackTestLargeCleanupFrees: Integer;
+begin
+  Result := ReleaseStackTestLargeFrees;
+end;
+{$ENDIF}
 procedure CleanupReleaseStacks;
 var
   LInd: Integer;
@@ -21748,7 +22243,12 @@ begin
         and (AcquireLockByte(MediumBlocksLocked)) then
       begin
         if MediumReleaseStack[LSlot].Pop(LMemBlock) then
-          FreeMediumBlock(LMemBlock, True)
+        begin
+          FreeMediumBlock(LMemBlock, True);
+          {$IFDEF EnableReleaseStackTestHooks}
+          InterlockedIncrement(ReleaseStackTestMediumFrees);
+          {$ENDIF}
+        end
         else
         begin
           UnlockMediumBlocks;
@@ -21758,7 +22258,12 @@ begin
         and (AcquireLockByte(LargeBlocksLocked)) then
       begin
         if LargeReleaseStack[LSlot].Pop(LMemBlock) then
-          FreeLargeBlock(LMemBlock, True)
+        begin
+          FreeLargeBlock(LMemBlock, True);
+          {$IFDEF EnableReleaseStackTestHooks}
+          InterlockedIncrement(ReleaseStackTestLargeFrees);
+          {$ENDIF}
+        end
         else
         begin
           UnlockLargeBlocks;

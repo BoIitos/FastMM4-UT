@@ -6,32 +6,72 @@ on:
       - master
     paths:
       - .github/workflows/main.yaml
+      - '**/*.pas'
+      - '**/*.inc'
+      - '**/*.asm'
+      - '**/*.dpr'
+      - '**/*.pp'
+      - '**/*.lpr'
       - FastMM4.pas
       - FastMM4Messages.pas
       - FastMM4Options.inc
       - FastMM4CompilerDefines.inc
+      - README.md
+      - ZLibMinimal.pas
+      - FullDebugMode DLL/FastMM_FullDebugMode.dpr
       - Tests/Advanced/**
       - Tests/Simple/IntegerOverflowTest.dpr
       - Tests/Simple/SimpleTest.dpr
       - Tests/Simple/CriticalSectionTest.dpr
       - Tests/Simple/SoftInvalidFreeMemTest.dpr
+      - Tests/Simple/ConcurrentForeignPointerStressTest.dpr
+      - Tests/Simple/MediumSafeUnlinkingTest.dpr
       - Tests/Simple/FpuStackTest.dpr
+      - Tests/check_asm_call_frames.py
+      - Tests/check_readme_mirror.py
+      - Tests/verify_guard_ordering.py
+      - Tests/guard_order_fixtures/**
+      - Tests/Simple/FullDebugModeTest.dpr
+      - Tests/Simple/ReleaseStackTest.dpr
 
   pull_request:
     branches:
       - master
     paths:
       - .github/workflows/main.yaml
+      - '**/*.pas'
+      - '**/*.inc'
+      - '**/*.asm'
+      - '**/*.dpr'
+      - '**/*.pp'
+      - '**/*.lpr'
       - FastMM4.pas
       - FastMM4Messages.pas
       - FastMM4Options.inc
       - FastMM4CompilerDefines.inc
+      - README.md
+      - ZLibMinimal.pas
+      - FullDebugMode DLL/FastMM_FullDebugMode.dpr
       - Tests/Advanced/**
       - Tests/Simple/IntegerOverflowTest.dpr
       - Tests/Simple/SimpleTest.dpr
       - Tests/Simple/CriticalSectionTest.dpr
       - Tests/Simple/SoftInvalidFreeMemTest.dpr
+      - Tests/Simple/ConcurrentForeignPointerStressTest.dpr
+      - Tests/Simple/MediumSafeUnlinkingTest.dpr
       - Tests/Simple/FpuStackTest.dpr
+      - Tests/check_asm_call_frames.py
+      - Tests/check_readme_mirror.py
+      - Tests/verify_guard_ordering.py
+      - Tests/guard_order_fixtures/**
+      - Tests/Simple/FullDebugModeTest.dpr
+      - Tests/Simple/ReleaseStackTest.dpr
+
+  schedule:
+    # 04:17 UTC on Sundays, which is what reaches the ten-second stress steps
+    # below. The odd minute keeps this off the hour, when the scheduler is
+    # busiest and a queued job waits longest.
+    - cron: '17 4 * * 0'
 
   workflow_dispatch:
 
@@ -46,6 +86,20 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Verify security guard ordering
+        run: python Tests/verify_guard_ordering.py
+
+      - name: Verify assembly call frames
+        run: python Tests/check_asm_call_frames.py
+
+      - name: Verify README mirror
+        run: python Tests/check_readme_mirror.py
 
       - name: Update apt sources
         run: sudo apt-get update
@@ -314,6 +368,28 @@ jobs:
           ./SoftInvalidFreeMemTest
 
       # =========================================================================
+      # Concurrent foreign-pointer stress - Linux
+      # Only the ten-second run, on the schedule or on demand. The short runs
+      # are covered on Windows, and this job exists to keep the Linux toolchain
+      # honest rather than to repeat them on every push.
+      # =========================================================================
+      - name: Run the long concurrent foreign-pointer stress (Linux 64-bit, ASM, 10 seconds)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: 5
+        run: |
+          cd $GITHUB_WORKSPACE/Tests/Simple
+          fpc -B -Mdelphi -Tlinux -Px86_64 -dLongStressTest -dSoftInvalidFreeMem -dIgnoreMemoryAllocatedBefore -dDisableMemoryLeakReporting -O4 ConcurrentForeignPointerStressTest.dpr
+          ./ConcurrentForeignPointerStressTest
+
+      - name: Run the long concurrent foreign-pointer stress (Linux 64-bit, Pure Pascal, 10 seconds)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: 5
+        run: |
+          cd $GITHUB_WORKSPACE/Tests/Simple
+          fpc -B -Mdelphi -Tlinux -Px86_64 -dLongStressTest -dDontUseASMVersion -dSoftInvalidFreeMem -dIgnoreMemoryAllocatedBefore -dDisableMemoryLeakReporting -O4 ConcurrentForeignPointerStressTest.dpr
+          ./ConcurrentForeignPointerStressTest
+
+      # =========================================================================
       # Overflow and Range Check Tests - Linux
       # Verify that normal allocator operations work under strict checking.
       # =========================================================================
@@ -353,9 +429,11 @@ jobs:
         # started and skipped.
         fpc: ${{ github.event_name == 'pull_request' && fromJSON('["release"]') || fromJSON('["release", "snapshot"]') }}
     env:
-      nasm: 'C:\Program Files\NASM\nasm.exe'
       fpc_release: 'C:\FPC\3.2.2\bin\i386-win32\fpc.exe'
       fpc_release_version: '3.2.2'
+      fpc_installer_asset: 'https://github.com/maximmasiutin/TinyWeb/releases/download/build-tools-fpc-3.2.2/fpc-3.2.2.win32.and.win64.exe'
+      fpc_installer_sourceforge: 'https://sourceforge.net/projects/freepascal/files/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe/download'
+      fpc_installer_sha256: '8C255390544B051388B577EB61C6191A04883264AFE0E3369B3600A56DAF7BDE'
       fpc_snapshot_branch: trunk
       fpc_snapshot_root: 'C:\FPC-snapshot'
 
@@ -368,18 +446,89 @@ jobs:
         run: |
           reg add "HKCU\SOFTWARE\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f
 
+      # The installed release compiler is cached so warm runs skip the
+      # download and the silent install; the snapshot leg also reads the
+      # release bin directory it restores. A cold run downloads from the
+      # TinyWeb build-tools release (GitHub's CDN), falls back to SourceForge,
+      # and refuses to execute an installer whose SHA-256 is not the pinned one.
+      - name: Cache FreePascal
+        id: fpc-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\FPC\3.2.2
+          key: fpc-3.2.2-win32-and-win64-${{ env.fpc_installer_sha256 }}-v1
+
+      # -f makes curl exit non-zero on an HTTP error instead of writing the
+      # error page into fpc_installer.exe, where it would surface later as a
+      # confusing failure of the install step. The primary origin is the
+      # TinyWeb build-tools release asset; the retries and the SourceForge
+      # fallback cover an origin that is briefly unavailable, and the pinned
+      # SHA-256 decides whether whatever arrived may be executed.
       - name: Download FreePascal installer
+        if: steps.fpc-cache.outputs.cache-hit != 'true'
         run: |
-          & 'curl.exe' @('-L', '-o', 'fpc_installer.exe', 'https://sourceforge.net/projects/freepascal/files/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe/download')
+          $curlArgs = @('-fL', '--retry', '3', '--retry-all-errors', '--retry-delay', '5', '--connect-timeout', '20', '--max-time', '600', '-o', 'fpc_installer.exe')
+          & 'curl.exe' ($curlArgs + "$Env:fpc_installer_asset")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'The GitHub release asset download failed; falling back to SourceForge.'
+            & 'curl.exe' ($curlArgs + "$Env:fpc_installer_sourceforge")
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash -Path 'fpc_installer.exe' -Algorithm SHA256).Hash
+          if ($hash -ne $Env:fpc_installer_sha256) {
+            Write-Error "FPC installer SHA-256 mismatch: got $hash, expected $Env:fpc_installer_sha256"
+            exit 1
+          }
 
       - name: Install FreePascal silently
+        if: steps.fpc-cache.outputs.cache-hit != 'true'
         run: |
           & '.\fpc_installer.exe' @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/LOG')
           Wait-Process -Name fpc_installer -Timeout 600
 
+      # Where the package's own installer puts nasm.exe is not this workflow's
+      # decision: on 2026-10-08 one windows-latest runner finished the install
+      # with exit code 0 and no nasm.exe under C:\Program Files\NASM, while a
+      # run of the same commit hours earlier found it there. So the executable
+      # is looked up after the install instead of assumed, the install is
+      # repeated once with --force when nothing is found, and the path found is
+      # exported as nasm for the steps that assemble.
       - name: Install NASM via Chocolatey
         run: |
-          & 'choco.exe' @('install', 'nasm', '-y')
+          function Find-Nasm {
+            $known = @(
+              @($Env:ProgramFiles, 'NASM\nasm.exe'),
+              @(${Env:ProgramFiles(x86)}, 'NASM\nasm.exe'),
+              @($Env:LOCALAPPDATA, 'bin\NASM\nasm.exe'),
+              @($Env:ChocolateyInstall, 'bin\nasm.exe')
+            )
+            foreach ($k in $known) {
+              if ($k[0]) {
+                $p = Join-Path $k[0] $k[1]
+                if (Test-Path -LiteralPath $p) { return $p }
+              }
+            }
+            $roots = @($Env:ProgramFiles, ${Env:ProgramFiles(x86)}, $Env:ChocolateyInstall) |
+              Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+            Get-ChildItem -LiteralPath $roots -Filter 'nasm.exe' -Recurse -Depth 4 -File -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          & 'choco.exe' @('install', 'nasm', '-y', '--no-progress')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nasm = Find-Nasm
+          if (-not $nasm) {
+            Write-Host 'nasm.exe not found after the install; what Chocolatey recorded, then a forced reinstall:'
+            & 'choco.exe' @('list', 'nasm')
+            & 'choco.exe' @('install', 'nasm', '-y', '--no-progress', '--force')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $nasm = Find-Nasm
+          }
+          if (-not $nasm) {
+            Write-Error 'nasm.exe not found after two Chocolatey installs; read the output above.'
+            exit 1
+          }
+          Write-Host "nasm.exe at $nasm"
+          "nasm=$nasm" | Out-File -FilePath $Env:GITHUB_ENV -Append -Encoding utf8
 
       # if: always() means this can run when the install itself failed and left
       # no log, and a wildcard that matches nothing is an error rather than an
@@ -457,10 +606,18 @@ jobs:
             Write-Error "fpc.exe not found at '$Env:fpc'. The installer or the snapshot layout changed; read the 'Output the installation log' step."
             exit 1
           }
-          if (-not (Test-Path -LiteralPath $Env:nasm)) {
-            Write-Error "nasm.exe not found at '$Env:nasm'. The Chocolatey package layout changed."
+          if (-not $Env:nasm -or -not (Test-Path -LiteralPath $Env:nasm)) {
+            Write-Error "nasm.exe not found at '$Env:nasm'; read the 'Install NASM via Chocolatey' step."
             exit 1
           }
+          $nasmVersion = (& $Env:nasm '-v' | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "'$Env:nasm -v' exited with $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "$nasmVersion at $Env:nasm"
+          "NASM ``$nasmVersion`` at ``$Env:nasm``" |
+            Out-File -FilePath $Env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           $reported = (& $Env:fpc '-iV' | Out-String).Trim()
           Write-Host "fpc $reported at $Env:fpc"
           "FreePascal ``$reported`` ($Env:leg) at ``$Env:fpc``" |
@@ -793,6 +950,92 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & '.\IntegerOverflowTest.exe'
 
+      # FullDebugModeTest: the allocation checks, then the two corruption modes,
+      # each of which reads its report back and requires the current stack
+      # trace after the thread ID. Each mode corrupts the heap, so each is its
+      # own process.
+
+      - name: Compile and run FullDebugModeTest (64-bit FullDebugMode)
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\FullDebugModeTest.exe
+          Copy-Item "$Env:GITHUB_WORKSPACE/FullDebugMode DLL/Precompiled/FastMM_FullDebugMode64.dll" .
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin64', '-Px86_64', '-dIgnoreMemoryAllocatedBefore', '-dFullDebugMode', '-dNoMessageBoxes', '-O4', 'FullDebugModeTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\FullDebugModeTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\FullDebugModeTest.exe' modify-after-free
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\FullDebugModeTest.exe' corrupt-footer
+
+      - name: Compile and run FullDebugModeTest (32-bit FullDebugMode)
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\FullDebugModeTest.exe
+          Copy-Item "$Env:GITHUB_WORKSPACE/FullDebugMode DLL/Precompiled/FastMM_FullDebugMode.dll" .
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-dIgnoreMemoryAllocatedBefore', '-dFullDebugMode', '-dNoMessageBoxes', '-O4', 'FullDebugModeTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\FullDebugModeTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\FullDebugModeTest.exe' modify-after-free
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\FullDebugModeTest.exe' corrupt-footer
+
+      # ReleaseStackTest: UseReleaseStack in the default critical-section
+      # builds, on the lock-byte path and on the EnterCriticalSection path.
+      # 32-bit only, because FastMM4LockFreeStack.pas does not assemble under
+      # 64-bit FreePascal. The test's own watchdog ends a hung run with exit
+      # code 3; the step timeout covers a watchdog that never fires. The first
+      # step also runs the four simulated infrastructure failures, each of
+      # which must end with exit code 2, so a broken harness cannot pass. The
+      # explicit exit 0 is needed because the runner exits with the last
+      # native exit code, which is 2 after the loop.
+
+      - name: Compile and run ReleaseStackTest (32-bit UseReleaseStack)
+        timeout-minutes: 5
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\ReleaseStackTest.exe
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-dUseReleaseStack', '-dNoMessageBoxes', '-dEnableReleaseStackTestHooks', '-O4', 'ReleaseStackTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ReleaseStackTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($fault in @('start-none', 'start-partial', 'wait-fail', 'watchdog-fail')) {
+            & '.\ReleaseStackTest.exe' $fault
+            if ($LASTEXITCODE -ne 2) {
+              Write-Output "ReleaseStackTest $fault returned $LASTEXITCODE, expected 2"
+              exit 1
+            }
+          }
+          exit 0
+
+      - name: Compile and run ReleaseStackTest (32-bit UseReleaseStack, critical sections)
+        timeout-minutes: 5
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\ReleaseStackTest.exe
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-dUseReleaseStack', '-dNoMessageBoxes', '-dEnableReleaseStackTestHooks', '-dDisablePauseAndSwitchToThread', '-O4', 'ReleaseStackTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ReleaseStackTest.exe'
+
+      # Without the three critical-section options the release stacks are
+      # used, and a cleanup-thread free used to leave the medium lock held
+      # (and the large lock without AssumeMultiThreaded, which
+      # ForceSingleThreaded removes), so the next lock hung.
+      - name: Compile and run ReleaseStackTest (32-bit UseReleaseStack, no critical-section options)
+        timeout-minutes: 5
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          foreach ($extra in @('', '-dForceSingleThreaded')) {
+            Remove-Item -Force -ErrorAction Ignore .\ReleaseStackTest.exe
+            $opts = @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-dUseReleaseStack', '-dNoMessageBoxes', '-dEnableReleaseStackTestHooks', '-dDontUseSmallBlocksLockedCriticalSection', '-dDontUseMediumBlocksLockedCriticalSection', '-dDontUseLargeBlocksLockedCriticalSection', '-O4')
+            if ($extra) { $opts += $extra }
+            & '${{ env.fpc }}' @($opts + 'ReleaseStackTest.dpr')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & '.\ReleaseStackTest.exe'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       # =========================================================================
       # Advanced Tests - Windows 32-bit
       # These stay release-only; FullDebugMode is covered by the group above.
@@ -908,6 +1151,57 @@ jobs:
           & '.\CriticalSectionTest.exe'
 
       # =========================================================================
+      # Concurrent foreign-pointer stress - Windows
+      # The first step runs without checking switches; the second adds -Co -Cr.
+      # The third selects LongStressTest, which is the ten-second duration the
+      # test was written for, and runs only on the schedule or on demand: a
+      # longer run finds nothing a short one leaves out, it only gives a race
+      # that needs an unlikely ordering more chances to appear, which is not
+      # worth charging to every push. It lives here rather than in a workflow
+      # of its own because installing FreePascal and NASM costs minutes and
+      # this job has already paid for them.
+      # =========================================================================
+      - name: Run concurrent foreign-pointer stress (64/32-bit, 2 seconds)
+        timeout-minutes: 3
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin64', '-Px86_64', '-dSoftInvalidFreeMem', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', '-O4', 'ConcurrentForeignPointerStressTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ConcurrentForeignPointerStressTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-dSoftInvalidFreeMem', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', '-O4', 'ConcurrentForeignPointerStressTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ConcurrentForeignPointerStressTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run checked concurrent foreign-pointer stress (64/32-bit, 1 second)
+        timeout-minutes: 3
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin64', '-Px86_64', '-Co', '-Cr', '-dCheckedStressTest', '-dSoftInvalidFreeMem', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', '-O4', 'ConcurrentForeignPointerStressTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ConcurrentForeignPointerStressTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-Co', '-Cr', '-dCheckedStressTest', '-dSoftInvalidFreeMem', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', '-O4', 'ConcurrentForeignPointerStressTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ConcurrentForeignPointerStressTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run the long concurrent foreign-pointer stress (64/32-bit, 10 seconds)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: 5
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin64', '-Px86_64', '-dLongStressTest', '-dSoftInvalidFreeMem', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', '-O4', 'ConcurrentForeignPointerStressTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ConcurrentForeignPointerStressTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-dLongStressTest', '-dSoftInvalidFreeMem', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', '-O4', 'ConcurrentForeignPointerStressTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\ConcurrentForeignPointerStressTest.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # =========================================================================
       # SoftInvalidFreeMem Tests - Windows
       # Compiled with -Co -Cr to enable overflow and range checking (issue #39).
       # =========================================================================
@@ -1005,6 +1299,38 @@ jobs:
           cd $Env:GITHUB_WORKSPACE/Tests/Advanced
           & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin64', '-Px86_64', '-Co', '-Cr', '-dSoftInvalidFreeMem', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', '-O4', 'AdvancedTest.dpr')
           & '.\AdvancedTest.exe'
+
+      - name: Test medium safe-unlinking 64-bit ASM
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\MediumSafeUnlinkingTest.exe
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin64', '-Px86_64', '-O4', '-dMediumSafeUnlinkingTest', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', 'MediumSafeUnlinkingTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\MediumSafeUnlinkingTest.exe'
+
+      - name: Test medium safe-unlinking 64-bit Pascal
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\MediumSafeUnlinkingTest.exe
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin64', '-Px86_64', '-O4', '-dMediumSafeUnlinkingTest', '-dDontUseASMVersion', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', 'MediumSafeUnlinkingTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\MediumSafeUnlinkingTest.exe'
+
+      - name: Test medium safe-unlinking 32-bit ASM
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\MediumSafeUnlinkingTest.exe
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-O4', '-dMediumSafeUnlinkingTest', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', 'MediumSafeUnlinkingTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\MediumSafeUnlinkingTest.exe'
+
+      - name: Test medium safe-unlinking 32-bit Pascal
+        run: |
+          cd $Env:GITHUB_WORKSPACE/Tests/Simple
+          Remove-Item -Force -ErrorAction Ignore .\MediumSafeUnlinkingTest.exe
+          & '${{ env.fpc }}' @('-B', '-Mdelphi', '-Twin32', '-Pi386', '-O4', '-dMediumSafeUnlinkingTest', '-dDontUseASMVersion', '-dIgnoreMemoryAllocatedBefore', '-dDisableMemoryLeakReporting', 'MediumSafeUnlinkingTest.dpr')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & '.\MediumSafeUnlinkingTest.exe'
 
       # =========================================================================
       # FPU stack regression - Windows

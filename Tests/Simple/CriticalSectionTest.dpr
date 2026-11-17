@@ -35,13 +35,16 @@ uses
   {$ENDIF}
   FastMM4 in '..\..\FastMM4.pas',
   FastMM4Messages in '..\..\FastMM4Messages.pas',
-  {$IFDEF FPC}
+  {SysUtils is load-bearing here and is not to be dropped for tidiness. It
+   declares Exception, which the handler below catches by name, and it installs
+   the runtime hook that turns a hardware fault into a catchable Pascal
+   exception. Removing it breaks the program twice over: the handler below
+   fails to compile, because the exception class it names is then undeclared,
+   and even were that name supplied from elsewhere, an access violation would
+   become runtime error 216 and kill the process rather than fail a named
+   check.}
   SysUtils,
   Classes;
-  {$ELSE}
-  System.SysUtils,
-  System.Classes;
-  {$ENDIF}
 
 const
   TEST_PASSED = 0;
